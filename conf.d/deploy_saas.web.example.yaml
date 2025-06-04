@@ -1,0 +1,42 @@
+# Saas Web - Taskfile (Node.js)
+# 配置文件: conf.d/deploy_saas.web.example.yaml
+# 任务链: build -> run
+
+version: "3"
+
+tasks:
+  # 构建任务 - 编译前端资源
+  build:
+    desc: 构建前端项目
+    cmds:
+      - echo "正在构建 saas.web..."
+      - npm install
+      - npm run build
+    silent: false
+
+  # 运行任务 - 部署静态资源
+  run:
+    desc: 部署 Web 静态资源
+    cmds:
+      - echo "正在部署 saas.web..."
+      - cp -r dist/* /opt/saas/web/
+      - systemctl restart nginx
+      - systemctl status nginx --no-pager
+    silent: false
+
+  # 完整发布流程 (手动触发)
+  publish:
+    desc: 完整发布流程
+    cmds:
+      - echo "正在发布 saas.web..."
+      - task: build
+      - task: run
+    silent: false
+
+  # 清理构建产物 (手动触发)
+  clean:
+    desc: 清理构建产物
+    cmds:
+      - echo "正在清理 saas.web..."
+      - rm -rf node_modules dist
+    silent: false

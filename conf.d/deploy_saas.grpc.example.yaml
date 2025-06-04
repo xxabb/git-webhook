@@ -1,0 +1,69 @@
+# Saas gRPC - Taskfile (Go)
+# 配置文件: conf.d/deploy_saas.grpc.example.yaml
+# 任务链: init -> test -> build -> run
+
+version: "3"
+
+tasks:
+  # 初始化任务 - 环境准备和依赖下载
+  init:
+    desc: 初始化环境和下载依赖
+    cmds:
+      - echo "正在初始化 saas.grpc..."
+      - go mod download
+      - go mod verify
+    silent: false
+
+  # 测试任务 - 运行单元测试
+  test:
+    desc: 运行单元测试
+    cmds:
+      - echo "正在测试 saas.grpc..."
+      - go test ./... -v -race -coverprofile=coverage.out
+    silent: false
+
+  # 构建任务 - 编译二进制文件
+  build:
+    desc: 构建 Go 项目
+    cmds:
+      - echo "正在构建 saas.grpc..."
+      - CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o bin/server ./cmd/server
+    silent: false
+
+  # 运行任务 - 重启服务
+  run:
+    desc: 重启 gRPC 服务
+    cmds:
+      - echo "正在重启 saas.grpc..."
+      - cp bin/server /opt/saas/grpc/
+      - systemctl restart saas-grpc
+      - systemctl status saas-grpc --no-pager
+    silent: false
+
+  # 完整发布流程 (手动触发)
+  publish:
+    desc: 完整发布流程
+    cmds:
+      - echo "正在发布 saas.grpc..."
+      - task: init
+      - task: test
+      - task: build
+      - task: run
+    silent: false
+
+  # 生成 protobuf 代码 (手动触发)
+  proto:
+    desc: 生成 protobuf 代码
+    cmds:
+      - echo "正在生成 saas.grpc protobuf 代码..."
+      - protoc --go_out=. --go-grpc_out=. proto/**/*.proto
+    silent: false
+
+  # 清理构建产物 (手动触发)
+  clean:
+    desc: 清理构建产物
+    cmds:
+      - echo "正在清理 saas.grpc..."
+      - rm -rf bin/
+      - rm -f coverage.out
+    silent: false

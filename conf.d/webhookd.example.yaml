@@ -1,0 +1,66 @@
+# Deploy Webhook Handler - 应用配置
+# 每个 app 定义一个仓库的 webhook 处理规则和任务链
+#
+# 字段说明:
+#   name                   - 应用唯一标识 (用于 webhook 匹配，对应 Gogs/Gitea 仓库名)
+#   title                  - 应用标题 (仅用于日志显示)
+#   repo_addr              - Git 仓库地址 (用于 clone/pull，例如: git@github.com:user/repo.git)
+#   repo_path              - 仓库本地路径 (工作目录)
+#   taskfile               - Taskfile 路径 (相对于 conf.d/ 目录，例如: deploy_Admin.Core.yaml)
+#   branches               - 监听的分支列表 (留空则监听所有分支)
+#   tags                   - 监听的标签列表 (留空则监听所有标签)
+#   commits_message_prefix - 提交信息前缀 (留空则触发所有)
+#   timeout                - 任务超时时间 (秒), 默认 300
+#   events                 - 监听的事件类型 (留空则监听所有, 可选: push, tag, pull_request)
+#   tasks                  - 任务链 (按顺序执行，对应 Taskfile 中的 task 名称)
+
+apps:
+  - name: saas.api
+    title: SasS Api
+    repo_addr: git@github/zhaopan:saas/saas.api.git
+    repo_path: /home/x/code/saas/saas.api
+    taskfile: deploy_saas.api.yaml
+    branches:
+      - dev
+    tags: []
+    commits_message_prefix: "pub"
+    timeout: 600
+    events:
+      - push
+    tasks:
+      - build
+      - run
+
+  - name: saas.web
+    title: Saas Web
+    repo_addr: git@github/zhaopan:saas/saas.web.git
+    repo_path: /home/x/code/saas/saas.web
+    taskfile: deploy_saas.web.yaml
+    branches:
+      - dev
+    tags: []
+    commits_message_prefix: "pub"
+    timeout: 300
+    events:
+      - push
+    tasks:
+      - build
+      - run
+
+  - name: saas.grpc
+    title: Saas gRPC
+    repo_addr: git@github/zhaopan:saas/saas.grpc.git
+    repo_path: /home/x/code/saas/saas.grpc
+    taskfile: deploy_saas.grpc.yaml
+    branches: [] # 监听所有分支
+    tags: []
+    commits_message_prefix: "deploy"
+    timeout: 300
+    events:
+      - push
+      - tag
+    tasks:
+      - init
+      - test
+      - build
+      - run

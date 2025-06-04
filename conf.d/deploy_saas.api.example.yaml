@@ -1,0 +1,41 @@
+# Saas API - Taskfile (Go)
+# 配置文件: conf.d/deploy_saas.api.example.yaml
+# 任务链: build -> run
+
+version: "3"
+
+tasks:
+  # 构建任务 - 编译二进制文件
+  build:
+    desc: 构建 Go 项目
+    cmds:
+      - echo "正在构建 saas.api..."
+      - CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o bin/server ./cmd/server
+    silent: false
+
+  # 运行任务 - 重启服务
+  run:
+    desc: 重启 API 服务
+    cmds:
+      - echo "正在重启 saas.api..."
+      - cp bin/server /opt/saas/api/
+      - systemctl restart saas-api
+      - systemctl status saas-api --no-pager
+    silent: false
+
+  # 完整发布流程 (手动触发)
+  publish:
+    desc: 完整发布流程
+    cmds:
+      - echo "正在发布 saas.api..."
+      - task: build
+      - task: run
+    silent: false
+
+  # 清理构建产物 (手动触发)
+  clean:
+    desc: 清理构建产物
+    cmds:
+      - echo "正在清理 saas.api..."
+      - rm -rf bin/
+    silent: false

@@ -1,0 +1,19 @@
+[Unit]
+Description=Webhook Handler - Git Webhook Trigger for Gogs/Gitea
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/deploy
+ExecStart=/opt/deploy/webhook-handler
+EnvironmentFile=/opt/deploy/.env
+Environment="LOGS_DIR=/opt/deploy/logs"
+Environment="PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

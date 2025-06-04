@@ -1,556 +1,701 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
-	"github.com/joho/godotenv"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath" // 新增导入
-	"runtime"       // 导入 runtime 包以获取操作系统信息
+	"os/signal"
+	"path/filepath"
+	"strconv"
 	"strings"
-	"sync" // 仍然需要 sync 包来使用 Mutex
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-task/task/v3"
+	"github.com/joho/godotenv"
+	"gopkg.in/natefinch/lumberjack.v2"
+	"gopkg.in/yaml.v3"
 )
 
-// Config 存储通用配置信息，不再包含 Applications
+// --- START: 配置类型定义 ---
+
+// Config 存储通用配置信息 (从环境变量加载)
 type Config struct {
 	Secret string
 	Port   string
 }
 
-// AppConf 对应 JSON 中单个应用的 conf 字段
-type AppConf struct {
-	RepoPath             string `json:"repo_path"`              // 仓库目录 (例如: "C:\\projects\\myrepo" 或 "/home/user/myrepo")
-	DockerComposeFile    string `json:"docker_compose_file"`    // docker-compose.yml 文件名
-	UseDockerCompose     bool   `json:"use_docker_compose"`     // 是否启用 docker-compose
-	RepoBranch           string `json:"repo_branch"`            // 编排分支 (要拉取代码的分支)
-	BuildBash            string `json:"build_bash"`             // 构建脚本命令 (例如: "npm install && npm run build")
-	GitPath              string `json:"git_path"`               // git 可执行文件路径 (例如: "C:\\Program Files\\Git\\cmd\\git.exe" 或 "/usr/bin/git")
-	CommitsMessagePrefix string `json:"commits_message_prefix"` // 提交信息前缀，如果匹配则执行 before_build_bash
-	BeforeBuildBash      string `json:"before_build_bash"`      // 在 build_bash 之前执行的脚本
-	BashSilent           bool   `json:"bash_silent"`            // 新增：控制 bash 命令是否静默输出
+// AppConfig 对应 YAML 中单个应用的配置
+type AppConfig struct {
+	Name                 string   `yaml:"name"`                    // 应用唯一标识 (用于 webhook 匹配)
+	Title                string   `yaml:"title"`                   // 应用标题 (仅用于日志显示)
+	RepoAddr             string   `yaml:"repo_addr"`               // Git 仓库地址 (用于 clone/pull)
+	Path                 string   `yaml:"repo_path"`               // 仓库本地路径 (工作目录)
+	TaskFile             string   `yaml:"taskfile"`                // Taskfile 路径 (相对于 conf.d/ 目录，例如: deploy_saas.server.yaml)
+	Branches             []string `yaml:"branches"`                // 监听的分支列表 (留空则监听所有分支)
+	Tags                 []string `yaml:"tags"`                    // 监听的标签列表 (留空则监听所有标签)
+	CommitsMessagePrefix string   `yaml:"commits_message_prefix"`  // 提交信息前缀 (留空则触发所有)
+	Timeout              int      `yaml:"timeout"`                 // 超时时间 (秒), 默认 300
+	Events               []string `yaml:"events"`                  // 监听的事件类型 (留空则监听所有)
+	Tasks                []string `yaml:"tasks"`                   // 任务链 (按顺序执行)
 }
 
-// JsonAppEntry 对应 JSON 中 applications 数组的每个元素
-type JsonAppEntry struct {
-	Name string  `json:"name"` // 仓库名 (Gogs Webhook payload 中的 "repository.name")
-	Conf AppConf `json:"conf"` // 配置
+// ConfigRoot 对应整个 YAML 配置文件的根结构
+type ConfigRoot struct {
+	Apps []AppConfig `yaml:"apps"`
 }
 
-// JsonConfigRoot 对应整个 JSON 文件的根结构
-type JsonConfigRoot struct {
-	Applications []JsonAppEntry `json:"applications"`
+// --- END: 配置类型定义 ---
+
+// --- START: 全局变量 ---
+
+// appConfigMap 存储标准化后的应用配置 (key: 标准化后的仓库名)
+var appConfigMap = make(map[string]AppConfig)
+
+// AppStatus 存储应用的构建状态信息
+type AppStatus struct {
+	Status          string    `json:"status"`
+	LastBuildTime   time.Time `json:"last_build_time"`
+	LastBuildResult string    `json:"last_build_result"`
 }
 
-// ApplicationConfig 用于程序内部使用，简化结构，直接包含已解析的配置
-type ApplicationConfig struct {
-	RepoPath             string
-	DockerComposeFile    string
-	UseDockerCompose     bool
-	RepoBranch           string
-	BuildBash            string
-	GitPath              string
-	CommitsMessagePrefix string
-	BeforeBuildBash      string
-	BashSilent           bool // 新增字段
+// appStatusMap 存储每个应用程序的当前状态
+var appStatusMap = make(map[string]*AppStatus)
+var appStatusMutex sync.RWMutex
+
+// wg 用于等待所有活跃构建完成后再退出
+var wg sync.WaitGroup
+
+// startTime 记录服务启动时间
+var startTime = time.Now()
+
+// deployHistory 存储部署历史记录
+type DeployRecord struct {
+	Time     time.Time `json:"time"`
+	Repo     string    `json:"repo"`
+	Branch   string    `json:"branch"`
+	Result   string    `json:"result"`
+	Duration string    `json:"duration"`
+	Error    string    `json:"error,omitempty"`
 }
 
-// 全局变量存储应用配置
-var appConfigMap = make(map[string]ApplicationConfig)
+var deployHistory []DeployRecord
+var historyMutex sync.Mutex
 
-// appStatusMap 存储每个应用程序的当前状态 (e.g., "idle", "building")
-// 使用常规 map 结合 Mutex 来实现并发安全的状态管理
-var appStatusMap = make(map[string]string)
-var appStatusMutex sync.Mutex // 保护 appStatusMap 的互斥锁
+// --- END: 全局变量 ---
 
 func main() {
-	// --- START: 日志文件设置 ---
-	// 首先判断是否启用文件日志
-	// 注意：为了让 getEnvAsBool 正常工作，godotenv.Load() 应该在日志设置之前
-	// 但为了日志本身能记录 godotenv.Load() 的错误，这里采取先加载 godotenv，再设置日志输出的方式
-	// 这样，即使 godotenv.Load 为空，至少错误信息也会在 os.Stdout 输出
+	// --- START: 日志设置 ---
+	enableFileLogging := os.Getenv("ENABLE_FILE_LOGGING")
+	if enableFileLogging == "true" || enableFileLogging == "1" {
+		logsDir := os.Getenv("LOGS_DIR")
+		if logsDir == "" {
+			logsDir = "logs"
+		}
+		if err := os.MkdirAll(logsDir, 0755); err != nil {
+			log.Fatalf("创建日志目录失败: %v", err)
+		}
+
+		logPath := filepath.Join(logsDir, "webhookd.log")
+		logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			log.Fatalf("打开日志文件失败 %s: %v", logPath, err)
+		}
+		defer logFile.Close()
+
+		// 同时输出到 stdout 和日志文件
+		log.SetOutput(io.MultiWriter(os.Stdout, logFile))
+		log.Println("文件日志已启用。")
+	} else {
+		log.Println("文件日志已禁用。仅输出到控制台。")
+	}
+	// --- END: 日志设置 ---
+
+	// --- START: 环境变量加载 ---
 	err := godotenv.Load()
 	if err != nil {
-		log.Printf("Warning: .env file not found or could not be loaded: %v. Using environment variables directly.", err)
+		log.Printf("警告: .env 文件未找到或无法加载: %v。直接使用环境变量。", err)
+	}
+	// --- END: 环境变量加载 ---
+
+	// --- START: 通用配置加载 ---
+	secret := os.Getenv("WEBHOOK_SECRET")
+	if secret == "" {
+		log.Fatalf("错误: WEBHOOK_SECRET 环境变量未设置。")
 	}
 
-	enableFileLogging := getEnvAsBool("ENABLE_FILE_LOGGING", false)
-	var logOutput io.Writer = os.Stdout // 默认日志输出到标准输出 (控制台)
-
-	if enableFileLogging {
-		// 获取当前运行目录
-		currentDir, err := os.Getwd()
-		if err != nil {
-			log.Fatalf("Error getting current working directory for log file: %v", err)
-		}
-		logFilePath := currentDir + "/deploy.log" // 日志文件名为 deploy.log
-
-		logFile, err := os.OpenFile(logFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			log.Fatalf("Failed to open log file %s: %v", logFilePath, err)
-		}
-		defer logFile.Close() // 确保程序退出时关闭日志文件
-
-		// 将日志输出同时重定向到控制台和文件
-		logOutput = io.MultiWriter(os.Stdout, logFile)
-		log.SetOutput(logOutput) // 设置全局日志输出
-		log.Printf("File logging enabled. All output also redirected to %s", logFilePath)
-	} else {
-		log.SetOutput(logOutput) // 仅输出到标准输出
-		log.Println("File logging disabled. Output to console only.")
-	}
-	// --- END: 日志文件设置 ---
-
-	// 加载通用配置 (Secret 和 Port)
-	generalConfig := Config{
-		Secret: os.Getenv("WEBHOOK_SECRET"), // 确保从 WEBHOOK_SECRET 获取
-		Port:   os.Getenv("PORT"),
+	port := os.Getenv("WEBHOOK_PORT")
+	if port == "" {
+		port = "8080"
+		log.Printf("WEBHOOK_PORT 环境变量未设置，使用默认值: %s", port)
 	}
 
-	if generalConfig.Secret == "" {
-		log.Fatalf("Error: WEBHOOK_SECRET environment variable not set.")
+	configFile := os.Getenv("APP_CONFIG_FILE")
+	if configFile == "" {
+		configFile = "conf.d/webhookd.yaml"
+		log.Printf("APP_CONFIG_FILE 环境变量未设置，使用默认值: %s", configFile)
 	}
-	if generalConfig.Port == "" {
-		generalConfig.Port = "8080" // 默认端口
-		log.Printf("PORT environment variable not set, using default: %s", generalConfig.Port)
-	}
+	// --- END: 通用配置加载 ---
 
-	// 加载应用程序配置
-	appConfigFile := os.Getenv("APP_CONFIG_FILE")
-	if appConfigFile == "" {
-		appConfigFile = "config.json" // 如果环境变量未设置，则使用默认值
-		log.Printf("APP_CONFIG_FILE environment variable not set, using default: %s", appConfigFile)
-	}
-	jsonConfig, err := loadConfig(appConfigFile)
+	// --- START: YAML 配置加载 ---
+	config, err := loadConfig(configFile)
 	if err != nil {
-		log.Fatalf("Error loading application config from %s: %v", appConfigFile, err)
+		log.Fatalf("加载应用配置失败 %s: %v", configFile, err)
 	}
 
-	// 将 JSON 配置转换为内部使用的 map
-	for _, appEntry := range jsonConfig.Applications {
-		// 将仓库名转换为小写并替换点为下划线，以便作为 map 的键
-		appName := strings.ToLower(strings.ReplaceAll(appEntry.Name, ".", "_"))
-
-		appConfigMap[appName] = ApplicationConfig{
-			RepoPath:             appEntry.Conf.RepoPath,
-			DockerComposeFile:    appEntry.Conf.DockerComposeFile,
-			UseDockerCompose:     appEntry.Conf.UseDockerCompose,
-			RepoBranch:           appEntry.Conf.RepoBranch,
-			BuildBash:            appEntry.Conf.BuildBash,
-			GitPath:              appEntry.Conf.GitPath,
-			CommitsMessagePrefix: appEntry.Conf.CommitsMessagePrefix,
-			BeforeBuildBash:      appEntry.Conf.BeforeBuildBash,
-			BashSilent:           appEntry.Conf.BashSilent, // 新增赋值
+	// 配置校验并填充 appConfigMap
+	for _, app := range config.Apps {
+		if app.Name == "" {
+			log.Fatalf("错误: name 不能为空")
 		}
-		log.Printf("  Loaded app: %s (normalized to %s) with config: %+v", appEntry.Name, appName, appConfigMap[appName])
+		if app.Path == "" {
+			log.Fatalf("错误: repo_path 不能为空 (应用: %s)", app.Name)
+		}
+		if len(app.Tasks) == 0 {
+			log.Fatalf("错误: tasks 列表不能为空 (应用: %s)", app.Name)
+		}
 
-		// 初始化应用程序状态为 "idle"
-		appStatusMutex.Lock()
-		appStatusMap[appName] = "idle"
-		appStatusMutex.Unlock()
+		// 使用 name 标准化后作为 map key (小写 + 点替换为下划线)
+		normalizedName := strings.ToLower(strings.ReplaceAll(app.Name, ".", "_"))
+		appConfigMap[normalizedName] = app
+		appStatusMap[normalizedName] = &AppStatus{
+			Status:          "idle",
+			LastBuildResult: "none",
+		}
+		log.Printf("  已加载应用: %s (name: %s, addr: %s, path: %s, branches: %v, tasks: %v)",
+			app.Title, app.Name, app.RepoAddr, app.Path, app.Branches, app.Tasks)
 	}
-	log.Println("Application configurations loaded successfully.")
+	log.Printf("已加载 %d 个应用: %v", len(config.Apps), getKeys(appConfigMap))
+	// --- END: YAML 配置加载 ---
 
-	// 设置 Chi 路由
+	// --- START: 启动时执行所有应用任务链 ---
+	runOnInit := os.Getenv("RUN_ON_STARTUP")
+	if runOnInit == "true" || runOnInit == "1" {
+		log.Println("正在执行所有应用的初始任务...")
+		for _, app := range config.Apps {
+			log.Printf("正在执行 %s 的任务...", app.Title)
+
+			wg.Add(1)
+			go func(appConfig AppConfig) {
+				defer wg.Done()
+
+				// panic recovery
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("PANIC 恢复 %s: %v", appConfig.Name, r)
+					}
+				}()
+
+				if err := executeTaskChain(appConfig); err != nil {
+					log.Printf("执行任务失败 %s: %v", appConfig.Name, err)
+					return
+				}
+				log.Printf("完成任务 %s", appConfig.Title)
+			}(app)
+		}
+		// 等待所有初始任务完成
+		wg.Wait()
+		log.Println("所有初始任务已完成。")
+	} else {
+		log.Println("RUN_ON_STARTUP 未设置，跳过初始任务。")
+	}
+	// --- END: 启动时执行所有应用任务链 ---
+
+	// --- START: Chi 路由设置 ---
 	r := chi.NewRouter()
-	r.Use(middleware.Logger) // 使用 Chi 的日志中间件
+	r.Use(middleware.Logger)
 
-	// Webhook 处理路由
-	r.Post("/webhook", func(w http.ResponseWriter, r *http.Request) {
-		handleWebhook(w, r, generalConfig.Secret)
+	// 健康检查端点
+	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "ok",
+			"uptime": time.Since(startTime).String(),
+		})
 	})
 
-	log.Printf("Server starting on port %s...", generalConfig.Port)
-	log.Printf("Current operating system: %s", runtime.GOOS)                    // 打印当前操作系统
-	log.Printf("Go program's PATH environment variable: %s", os.Getenv("PATH")) // 打印程序启动时的 PATH
-	log.Fatal(http.ListenAndServe(":"+generalConfig.Port, r))
+	// 状态查询端点
+	r.Get("/status/{repo}", func(w http.ResponseWriter, r *http.Request) {
+		repo := chi.URLParam(r, "repo")
+		// 标准化仓库名
+		normalizedName := strings.ToLower(strings.ReplaceAll(repo, ".", "_"))
+		status := getStatus(normalizedName)
+		if status == nil {
+			http.Error(w, "未找到仓库", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(status)
+	})
+
+	// 部署历史查询端点
+	r.Get("/history", func(w http.ResponseWriter, r *http.Request) {
+		limitStr := r.URL.Query().Get("limit")
+		limit := 10
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
+			limit = l
+		}
+		repo := r.URL.Query().Get("repo")
+
+		historyMutex.Lock()
+		defer historyMutex.Unlock()
+
+		var filtered []DeployRecord
+		for i := len(deployHistory) - 1; i >= 0 && len(filtered) < limit; i-- {
+			if repo == "" || deployHistory[i].Repo == repo {
+				filtered = append(filtered, deployHistory[i])
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(filtered)
+	})
+
+	// Webhook 端点
+	r.Post("/webhook", func(w http.ResponseWriter, r *http.Request) {
+		handleWebhook(w, r, secret)
+	})
+	// --- END: Chi 路由设置 ---
+
+	// --- START: HTTP Server + 优雅关闭 ---
+	srv := &http.Server{
+		Addr:    ":" + port,
+		Handler: r,
+	}
+
+	// 启动 HTTP 服务器 (goroutine)
+	go func() {
+		log.Printf("服务器正在启动，端口 %s...", port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("服务器错误: %v", err)
+		}
+	}()
+
+	// 监听系统信号
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-quit
+	log.Printf("收到信号: %v。正在关闭...", sig)
+
+	// 优雅关闭 HTTP 服务器 (等待活跃请求完成)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("服务器关闭错误: %v", err)
+	}
+	log.Println("HTTP 服务器已停止。")
+
+	// 等待所有活跃构建完成
+	log.Println("正在等待活跃构建完成...")
+	wg.Wait()
+	log.Println("所有构建已完成。服务器已停止。")
+	// --- END: HTTP Server + 优雅关闭 ---
 }
 
-// loadConfig 从 JSON 文件加载应用程序配置
-func loadConfig(filePath string) (*JsonConfigRoot, error) {
-	file, err := os.Open(filePath)
+// loadConfig 从 YAML 文件加载应用配置
+func loadConfig(filePath string) (*ConfigRoot, error) {
+	data, err := os.ReadFile(filePath)
 	if err != nil {
-		return nil, fmt.Errorf("error opening config file: %w", err)
-	}
-	defer file.Close()
-
-	bytes, err := io.ReadAll(file)
-	if err != nil {
-		return nil, fmt.Errorf("error reading config file: %w", err)
+		return nil, fmt.Errorf("读取配置文件失败: %w", err)
 	}
 
-	var config JsonConfigRoot
-	if err := json.Unmarshal(bytes, &config); err != nil {
-		return nil, fmt.Errorf("error unmarshalling config JSON: %w", err)
+	var config ConfigRoot
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("解析配置 YAML 失败: %w", err)
 	}
 	return &config, nil
 }
 
-// getEnvAsBool 从环境变量获取布尔值
-func getEnvAsBool(name string, defaultValue bool) bool {
-	valStr := os.Getenv(name)
-	if valStr == "" {
-		return defaultValue
+// verifySignature 验证 Gogs/Gitea Webhook 的 HMAC-SHA256 签名
+func verifySignature(r *http.Request, body []byte, secret string) bool {
+	// Gitea 优先，Gogs 兼容
+	signature := r.Header.Get("X-Gitea-Signature")
+	if signature == "" {
+		signature = r.Header.Get("X-Gogs-Signature")
 	}
-	switch strings.ToLower(valStr) {
-	case "true", "1", "t", "y", "yes":
-		return true
-	case "false", "0", "f", "n", "no":
+	if signature == "" {
 		return false
-	default:
-		return defaultValue
 	}
+
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	expected := hex.EncodeToString(mac.Sum(nil))
+
+	return hmac.Equal([]byte(expected), []byte(signature))
 }
 
-// handleWebhook 处理 Gogs Webhook 请求
+// handleWebhook 处理 Gogs/Gitea Webhook 请求
 func handleWebhook(w http.ResponseWriter, r *http.Request, secret string) {
+	// 1. 读取 request body (限制 10MB)
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, "Error reading request body", http.StatusInternalServerError)
+		log.Printf("读取请求体失败 %s: %v", r.RemoteAddr, err)
+		http.Error(w, "请求体过大", http.StatusBadRequest)
 		return
 	}
 
-	// TODO: 实现签名验证 (如果 Gogs 启用了 Secret)
-	if !verifySignature(r, body, secret) { // 取消注释，启用签名验证
-		http.Error(w, "Invalid signature", http.StatusUnauthorized)
-		return
+	// 2. 签名验证 (在 payload 解析前完成)
+	// 注意: 生产环境必须启用签名验证
+	if secret != "" && secret != "test-secret" {
+		if !verifySignature(r, body, secret) {
+			log.Printf("签名验证失败 %s", r.RemoteAddr)
+			http.Error(w, "签名无效", http.StatusForbidden)
+			return
+		}
 	}
 
+	// 3. 解析 payload
 	var payload struct {
 		Ref        string `json:"ref"`
 		Repository struct {
 			Name string `json:"name"`
 		} `json:"repository"`
-		// 新增 Commits 字段以获取提交信息
 		Commits []struct {
-			ID      string `json:"id"`
 			Message string `json:"message"`
-			URL     string `json:"url"`
-			Author  struct {
-				Name  string `json:"name"`
-				Email string `json:"email"`
-				// Username string `json:"username"` // Gogs 可能没有 username
-			} `json:"author"`
-			// Timestamp string `json:"timestamp"` // 暂不需要
 		} `json:"commits"`
 	}
 
 	if err := json.Unmarshal(body, &payload); err != nil {
-		http.Error(w, "Error unmarshalling payload", http.StatusBadRequest)
-		log.Printf("Error unmarshalling webhook payload: %v", err)
+		http.Error(w, "解析 payload 失败", http.StatusBadRequest)
+		log.Printf("解析 webhook payload 失败: %v", err)
 		return
 	}
 
+	// 4. 仓库名标准化并匹配
 	repoName := strings.ToLower(strings.ReplaceAll(payload.Repository.Name, ".", "_"))
-	branchName := strings.Replace(payload.Ref, "refs/heads/", "", 1) // 提取分支名
-
-	log.Printf("Received webhook for repository: %s, branch: %s, with %d commits", payload.Repository.Name, branchName, len(payload.Commits))
-
 	appConfig, ok := appConfigMap[repoName]
 	if !ok {
-		log.Printf("No configuration found for repository: %s", payload.Repository.Name)
-		http.Error(w, fmt.Sprintf("No configuration found for repository: %s", payload.Repository.Name), http.StatusNotFound)
+		log.Printf("未找到仓库配置: %s", payload.Repository.Name)
+		http.Error(w, fmt.Sprintf("未找到仓库配置: %s", payload.Repository.Name), http.StatusNotFound)
 		return
 	}
 
-	// 检查分支是否匹配
-	if appConfig.RepoBranch != "" && appConfig.RepoBranch != branchName {
-		log.Printf("Webhook branch '%s' does not match configured branch '%s' for %s. Skipping build.", branchName, appConfig.RepoBranch, payload.Repository.Name)
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "Branch mismatch. Skipped.")
+	// 5. 事件类型过滤
+	eventType := r.Header.Get("X-Gitea-Event")
+	if eventType == "" {
+		eventType = r.Header.Get("X-Gogs-Event")
+	}
+	if eventType != "" && len(appConfig.Events) > 0 {
+		matched := false
+		for _, e := range appConfig.Events {
+			if e == eventType {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			log.Printf("事件 '%s' 不在配置的事件列表 %v 中 (%s)。已跳过。",
+				eventType, appConfig.Events, payload.Repository.Name)
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, "事件不匹配。已跳过。")
+			return
+		}
+	}
+
+	// 5. 标签过滤
+	isTag := strings.HasPrefix(payload.Ref, "refs/tags/")
+	tagName := ""
+	if isTag {
+		tagName = strings.Replace(payload.Ref, "refs/tags/", "", 1)
+	}
+
+	// 如果配置了 tags，只触发匹配的标签
+	if isTag && len(appConfig.Tags) > 0 {
+		matched := false
+		for _, t := range appConfig.Tags {
+			if t == tagName {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			log.Printf("标签 '%s' 不在配置的标签列表 %v 中 (%s)。已跳过。",
+				tagName, appConfig.Tags, payload.Repository.Name)
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, "标签不匹配。已跳过。")
+			return
+		}
+	}
+
+	// 6. 分支过滤 (仅对非标签推送生效)
+	branchName := strings.Replace(payload.Ref, "refs/heads/", "", 1)
+	if !isTag && len(appConfig.Branches) > 0 {
+		matched := false
+		for _, b := range appConfig.Branches {
+			if b == branchName {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			log.Printf("分支 '%s' 不在配置的分支列表 %v 中 (%s)。已跳过。",
+				branchName, appConfig.Branches, payload.Repository.Name)
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, "分支不匹配。已跳过。")
+			return
+		}
+	}
+
+	// 7. 提交信息前缀过滤
+	if appConfig.CommitsMessagePrefix != "" && len(payload.Commits) > 0 {
+		matched := false
+		for _, commit := range payload.Commits {
+			if strings.HasPrefix(commit.Message, appConfig.CommitsMessagePrefix) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			log.Printf("没有提交消息匹配前缀 '%s' (%s)。已跳过。",
+				appConfig.CommitsMessagePrefix, payload.Repository.Name)
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, "提交消息前缀不匹配。已跳过。")
+			return
+		}
+	}
+
+	// 8. 互斥锁检查
+	if !tryAcquire(repoName) {
+		log.Printf("应用 %s 正在构建中。已跳过。", payload.Repository.Name)
+		http.Error(w, fmt.Sprintf("应用 %s 正在构建中。", payload.Repository.Name), http.StatusTooManyRequests)
 		return
 	}
 
-	// --- START: 锁状态检查和获取 (使用 Mutex 保护) ---
-	appStatusMutex.Lock()                   // 获取锁
-	currentStatus := appStatusMap[repoName] // 直接从 map 读取状态
-	log.Printf("Application %s (repo: %s) current status before lock attempt: %v", payload.Repository.Name, repoName, currentStatus)
-
-	if currentStatus == "building" {
-		appStatusMutex.Unlock() // 如果正在构建，释放锁并跳过
-		log.Printf("Application %s (repo: %s) is already building. Skipping this webhook. Status found: %v", payload.Repository.Name, repoName, currentStatus)
-		http.Error(w, fmt.Sprintf("Application %s is already building.", payload.Repository.Name), http.StatusTooManyRequests)
-		return
-	}
-
-	// 设置状态为 "building"
-	appStatusMap[repoName] = "building"
-	appStatusMutex.Unlock() // 释放锁，允许其他 goroutine 读取状态
-	log.Printf("Application %s (repo: %s) lock successfully acquired. Status set to building.", payload.Repository.Name, repoName)
-	// --- END: 锁状态检查和获取 ---
-
+	// 9. 立即返回 200 OK
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "Webhook received and processing started for %s:%s", payload.Repository.Name, branchName)
+	fmt.Fprintf(w, "Webhook 已接收，正在处理 %s:%s", payload.Repository.Name, branchName)
 
-	// 提取所有提交信息
-	var commitMessages []string
-	for _, commit := range payload.Commits {
-		commitMessages = append(commitMessages, commit.Message)
-	}
-
-	// 异步执行构建操作，避免阻塞 HTTP 响应
+	// 10. 异步执行任务链
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
+
+		// panic recovery
 		defer func() {
-			// 无论构建成功或失败，都会执行此处，释放锁
-			appStatusMutex.Lock() // 再次获取锁以修改状态
-			log.Printf("Attempting to release lock for application %s (repo: %s)...", payload.Repository.Name, repoName)
-			appStatusMap[repoName] = "idle"
-			appStatusMutex.Unlock() // 释放锁
-			log.Printf("Application %s (repo: %s) status successfully set to idle.", payload.Repository.Name, repoName)
+			if r := recover(); r != nil {
+				log.Printf("PANIC 恢复 %s: %v", payload.Repository.Name, r)
+				release(repoName, "failed", fmt.Errorf("panic: %v", r))
+			}
 		}()
 
-		log.Printf("Starting build process for repository: %s, branch: %s", payload.Repository.Name, branchName)
+		startTime := time.Now()
+		log.Printf("正在执行任务链: 仓库 %s, 分支 %s, 任务 %v",
+			payload.Repository.Name, branchName, appConfig.Tasks)
 
-		// 执行拉取代码和构建的命令
-		if err := updateAndBuild(appConfig, branchName, commitMessages); err != nil { // 传递 commitMessages
-			log.Printf("Error updating and building for %s: %v", payload.Repository.Name, err)
-			return // 如果这里返回错误，defer 依然会执行
+		if err := executeTaskChain(appConfig); err != nil {
+			log.Printf("执行任务链失败 %s: %v", payload.Repository.Name, err)
+			release(repoName, "failed", err)
+			return
 		}
-		log.Printf("Successfully processed webhook for repository: %s, branch: %s", payload.Repository.Name, branchName)
+
+		duration := time.Since(startTime)
+		log.Printf("成功处理 webhook: 仓库 %s, 分支 %s, 耗时 %v",
+			payload.Repository.Name, branchName, duration)
+		release(repoName, "success", nil)
 	}()
 }
 
-// runCommand 在指定目录下运行命令并记录输出
-// 新增 silent 参数，控制命令输出是否静默
-func runCommand(dir string, name string, silent bool, arg ...string) error { // 修正参数列表顺序
-	cmd := exec.Command(name, arg...)
-	cmd.Dir = dir
-	log.Printf("Executing command: %s %v in %s (Silent: %t)", name, arg, dir, silent) // 打印静默状态
-
-	if silent {
-		cmd.Stdout = io.Discard // 静默输出到 /dev/null
-		cmd.Stderr = io.Discard // 静默错误输出到 /dev/null
-	} else {
-		cmd.Stdout = os.Stdout // 输出到程序的标准输出
-		cmd.Stderr = os.Stderr // 输出到程序的标准错误
+// tryAcquire 尝试获取仓库的构建锁
+func tryAcquire(repoName string) bool {
+	appStatusMutex.Lock()
+	defer appStatusMutex.Unlock()
+	if appStatusMap[repoName] != nil && appStatusMap[repoName].Status == "building" {
+		return false
 	}
-
-	err := cmd.Run()
-	if err != nil {
-		return fmt.Errorf("command '%s %v' failed: %w", name, arg, err)
+	appStatusMap[repoName] = &AppStatus{
+		Status: "building",
 	}
-	return nil
+	return true
 }
 
-// updateAndBuild 拉取代码、条件性执行前置构建脚本和构建
-// 接收 ApplicationConfig 结构体和提交信息
-func updateAndBuild(app ApplicationConfig, branchToPull string, commitMessages []string) error {
-	log.Println("Updating and building...")
+// release 释放仓库的构建锁
+func release(repoName string, result string, err error) {
+	appStatusMutex.Lock()
+	defer appStatusMutex.Unlock()
+	if appStatusMap[repoName] != nil {
+		appStatusMap[repoName].Status = "idle"
+		appStatusMap[repoName].LastBuildTime = time.Now()
+		appStatusMap[repoName].LastBuildResult = result
+	}
+}
 
-	gitPath := app.GitPath       // 直接使用 config.json 中提供的 git 路径
-	repoPath := app.RepoPath     // 直接使用 config.json 中提供的仓库路径
-	buildBash := app.BuildBash   // 直接使用 config.json 中提供的构建脚本
-	bashSilent := app.BashSilent // 获取静默配置
+// getStatus 获取仓库的状态
+func getStatus(repoName string) *AppStatus {
+	appStatusMutex.RLock()
+	defer appStatusMutex.RUnlock()
+	return appStatusMap[repoName]
+}
 
-	// 如果 gitPath 为空，提供一个 OS 默认值
-	if gitPath == "" {
-		switch runtime.GOOS {
-		case "windows":
-			gitPath = "git.exe" // Windows 默认，期望 git 在 PATH 中
-		case "linux", "darwin": // Linux 和 macOS
-			gitPath = "/usr/bin/git" // Linux/macOS 默认路径
-		default:
-			log.Printf("Unsupported operating system for default git path: %s. Please specify git_path in config.json.", runtime.GOOS)
-			return fmt.Errorf("unsupported operating system for default git path: %s", runtime.GOOS)
+// executeTaskChain 使用 go-task/v3 Go 库 API 执行任务链
+func executeTaskChain(appConfig AppConfig) error {
+	repoName := appConfig.Name
+	repoPath := appConfig.Path
+	repoAddr := appConfig.RepoAddr
+	taskFile := appConfig.TaskFile
+	tasks := appConfig.Tasks
+
+	// 如果仓库目录不存在且配置了 repo_addr，自动克隆
+	if _, err := os.Stat(repoPath); os.IsNotExist(err) && repoAddr != "" {
+		log.Printf("仓库 %s 未找到，正在从 %s 克隆...", repoPath, repoAddr)
+		if err := cloneRepository(repoAddr, repoPath); err != nil {
+			return fmt.Errorf("克隆仓库失败: %w", err)
 		}
-		log.Printf("Git executable path not specified in config.json, using OS default: %s", gitPath)
 	}
 
-	if repoPath == "" {
-		log.Printf("Repository path not specified in config.json for app. Cannot proceed.")
-		return fmt.Errorf("repository path not specified in config.json")
+	// 打开 per-repo 日志文件
+	logWriter, err := openRepoLog(repoName)
+	if err != nil {
+		log.Printf("警告: 打开仓库日志失败 %s: %v。仅使用 stdout。", repoName, err)
+		logWriter = nil
 	}
 
-	// --- 检查 git 可执行文件是否存在和可执行 ---
-	gitFileInfo, err := os.Stat(gitPath)
-	if os.IsNotExist(err) {
-		log.Printf("ERROR: Git executable not found at %s: %v", gitPath, err)
-		return fmt.Errorf("git executable not found at %s: %w", gitPath, err)
-	}
-	if err != nil { // Other errors during os.Stat
-		log.Printf("ERROR: Error checking git executable at %s: %v", gitPath, err)
-		return fmt.Errorf("error checking git executable at %s: %w", gitPath, err)
+	// 创建 MultiWriter 同时输出到 stdout 和日志文件
+	var writer io.Writer = os.Stdout
+	if logWriter != nil {
+		writer = io.MultiWriter(os.Stdout, logWriter)
 	}
 
-	// Check if it's a regular file
-	if !gitFileInfo.Mode().IsRegular() {
-		log.Printf("ERROR: %s is not a regular file (mode: %v)", gitPath, gitFileInfo.Mode())
-		return fmt.Errorf("%s is not a regular file", gitPath)
-	}
-
-	// For Windows, executability is primarily by extension, not Unix permission bits
-	// We will be more lenient here for Windows .exe files
-	isExecutable := true
-	if runtime.GOOS == "windows" {
-		// On Windows, check if it has a common executable extension
-		ext := strings.ToLower(filepath.Ext(gitPath))
-		if ext != ".exe" && ext != ".com" && ext != ".bat" && ext != ".cmd" && ext != ".ps1" {
-			// If it's Windows and not a common executable extension, it's likely not executable
-			isExecutable = false
-		}
-		// Note: os.Stat on Windows for .exe files usually sets the execute bit.
-		// If it's not set, it's a deeper permission issue or file corruption.
-		// We'll still do the Unix-style check as a fallback/extra verification,
-		// but prioritize the extension check for typical Windows executables.
+	// 确定 Taskfile 路径
+	taskFilePath := ""
+	if taskFile != "" {
+		// 使用指定的 Taskfile 路径 (相对于 conf.d/ 目录)
+		taskFilePath = filepath.Join("conf.d", taskFile)
 	} else {
-		// For Unix-like systems, check the executable permission bit
-		if gitFileInfo.Mode().Perm()&0111 == 0 {
-			isExecutable = false
-		}
+		// 默认使用仓库路径下的 Taskfile.yml
+		taskFilePath = filepath.Join(repoPath, "Taskfile.yml")
 	}
 
-	if !isExecutable {
-		log.Printf("ERROR: Git executable at %s is not executable (mode: %v)", gitPath, gitFileInfo.Mode())
-		return fmt.Errorf("git executable at %s is not executable", gitPath)
-	}
-	log.Printf("Verified git executable at %s exists and is runnable.", gitPath)
+	log.Printf("Taskfile 路径: %s", taskFilePath)
 
-	// 确保仓库目录存在
-	if _, err := os.Stat(repoPath); os.IsNotExist(err) {
-		log.Printf("Repository path does not exist: %s", repoPath)
-		return fmt.Errorf("repository path does not exist: %w", err)
+	// 检查 Taskfile 是否存在
+	if _, err := os.Stat(taskFilePath); os.IsNotExist(err) {
+		return fmt.Errorf("Taskfile 未找到: %s", taskFilePath)
 	}
 
-	// 1. 切换到目标分支
-	log.Printf("Changing to repository directory: %s", repoPath)
-	// git checkout 命令的输出通常不希望被静默，因为它可能包含重要信息
-	if err := runCommand(repoPath, gitPath, false, "checkout", branchToPull); err != nil { // 调整参数顺序
-		return fmt.Errorf("git checkout %s failed: %w", branchToPull, err)
+	// 转换为绝对路径
+	absTaskFilePath, err := filepath.Abs(taskFilePath)
+	if err != nil {
+		return fmt.Errorf("获取绝对路径失败: %w", err)
 	}
-	log.Printf("Successfully checked out branch: %s", branchToPull)
 
-	// 2. 拉取最新代码
-	// git pull 命令的输出通常不希望被静默
-	if err := runCommand(repoPath, gitPath, false, "pull"); err != nil { // 调整参数顺序
-		return fmt.Errorf("git pull failed: %w", err)
+	var buf bytes.Buffer
+	e := task.NewExecutor(
+		task.WithDir(repoPath),  // 使用仓库路径作为工作目录
+		task.WithEntrypoint(absTaskFilePath),  // 指定 Taskfile 路径
+		task.WithStdout(&buf),
+		task.WithStderr(&buf),
+	)
+
+	if err := e.Setup(); err != nil {
+		return fmt.Errorf("任务设置错误: %w", err)
 	}
-	log.Println("Successfully pulled latest code.")
 
-	// --- 根据 commit message prefix 条件性执行 before_build_bash ---
-	shouldRunBeforeBuild := false
-	if app.CommitsMessagePrefix != "" && len(commitMessages) > 0 {
-		for _, msg := range commitMessages {
-			if strings.HasPrefix(msg, app.CommitsMessagePrefix) {
-				log.Printf("Commit message '%s' matches prefix '%s'. Preparing to run before_build_bash.", msg, app.CommitsMessagePrefix)
-				shouldRunBeforeBuild = true
-				break // 只要有一个匹配就执行
+	// 设置超时时间
+	timeout := appConfig.Timeout
+	if timeout <= 0 {
+		timeout = 300 // 默认 5分钟
+	}
+
+	for _, taskName := range tasks {
+		buf.Reset()
+		timestamp := time.Now().Format("2006-01-02 15:04:05")
+		fmt.Fprintf(writer, "[%s] [%s] [%s] Starting task (timeout: %ds)\n", timestamp, repoName, taskName, timeout)
+
+		// 使用 context.WithTimeout 实现超时控制
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
+		err := e.Run(ctx, &task.Call{Task: taskName})
+		cancel()
+
+		if err != nil {
+			output := buf.String()
+			if ctx.Err() == context.DeadlineExceeded {
+				fmt.Fprintf(writer, "[%s] [%s] [%s] 超时 %d 秒\n", timestamp, repoName, taskName, timeout)
+				return fmt.Errorf("任务 %s 超时 %d 秒", taskName, timeout)
 			}
-		}
-	}
-
-	if shouldRunBeforeBuild && app.BeforeBuildBash != "" {
-		log.Printf("Executing before_build script: %s (Silent: %t)", app.BeforeBuildBash, bashSilent)
-		var cmdName string
-		var cmdArgs []string
-
-		switch runtime.GOOS {
-		case "windows":
-			cmdName = "cmd"
-			cmdArgs = []string{"/c", app.BeforeBuildBash}
-		case "linux", "darwin":
-			cmdName = "bash"
-			cmdArgs = []string{"-c", app.BeforeBuildBash}
-		default:
-			log.Printf("Unsupported operating system for before_build script execution: %s", runtime.GOOS)
-			return fmt.Errorf("unsupported OS for before_build script: %s", runtime.GOOS)
+			fmt.Fprintf(writer, "[%s] [%s] [%s] 失败: %v\n", timestamp, repoName, taskName, err)
+			if output != "" {
+				fmt.Fprintf(writer, "[%s] [%s] [%s] 输出:\n%s", timestamp, repoName, taskName, output)
+			}
+			return fmt.Errorf("任务 %s 失败: %w", taskName, err)
 		}
 
-		if err := runCommand(repoPath, cmdName, bashSilent, cmdArgs...); err != nil { // 调整参数顺序
-			return fmt.Errorf("before_build script '%s' failed: %w", app.BeforeBuildBash, err)
+		output := buf.String()
+		fmt.Fprintf(writer, "[%s] [%s] [%s] 成功完成\n", timestamp, repoName, taskName)
+		if output != "" {
+			fmt.Fprintf(writer, "[%s] [%s] [%s] 输出:\n%s", timestamp, repoName, taskName, output)
 		}
-		log.Println("Before_build script executed successfully.")
-	} else if shouldRunBeforeBuild && app.BeforeBuildBash == "" {
-		log.Println("Commit message matched prefix, but before_build_bash is empty. Skipping before_build step.")
-	} else {
-		log.Println("No commit message matched prefix, or prefix not specified. Skipping before_build step.")
-	}
-	// --- END NEW ---
-
-	// 3. 执行主构建脚本（如果提供）
-	if buildBash != "" {
-		log.Printf("Executing main build script: %s (Silent: %t)", buildBash, bashSilent)
-		var cmdName string
-		var cmdArgs []string
-
-		switch runtime.GOOS {
-		case "windows":
-			cmdName = "cmd"
-			cmdArgs = []string{"/c", buildBash}
-		case "linux", "darwin":
-			cmdName = "bash"
-			cmdArgs = []string{"-c", buildBash}
-		default:
-			log.Printf("Unsupported operating system for main build script execution: %s", runtime.GOOS)
-			return fmt.Errorf("unsupported OS for main build script: %s", runtime.GOOS)
-		}
-
-		if err := runCommand(repoPath, cmdName, bashSilent, cmdArgs...); err != nil { // 调整参数顺序
-			return fmt.Errorf("main build script '%s' failed: %w", buildBash, err)
-		}
-		log.Println("Main build script executed successfully.")
-	} else {
-		log.Println("No main build script specified, skipping build step.")
-	}
-
-	// 4. 如果使用 docker-compose，重启容器
-	if app.UseDockerCompose {
-		log.Println("Docker Compose is enabled. Restarting container...")
-		dockerComposeFile := app.DockerComposeFile // 获取 docker-compose 文件名
-		if dockerComposeFile == "" {
-			dockerComposeFile = "docker-compose.yml" // 默认文件名
-		}
-		// docker-compose 命令的输出通常不希望被静默，因为它可能包含重要信息
-		if err := restartContainer(repoPath, dockerComposeFile, false); err != nil { // 传入 false
-			return fmt.Errorf("failed to restart container with docker-compose: %w", err)
-		}
-		log.Println("Container restarted successfully.")
 	}
 
 	return nil
 }
 
-// restartContainer 使用 docker-compose 重启服务
-// 新增 silent 参数，控制命令输出是否静默
-func restartContainer(repoPath string, dockerComposeFile string, silent bool) error { // 修正参数列表
-	log.Printf("Restarting container (Silent: %t)...", silent)
-	// 使用 docker-compose 重启服务
-	cmd := exec.Command("docker-compose", "-f", dockerComposeFile, "up", "-d")
-	cmd.Dir = repoPath // 确保在正确的目录下执行 docker-compose
-
-	if silent {
-		cmd.Stdout = io.Discard
-		cmd.Stderr = io.Discard
-	} else {
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+// openRepoLog 打开或创建 per-repo 的日志文件 (使用 lumberjack 实现日志轮转)
+func openRepoLog(repoName string) (io.Writer, error) {
+	enableFileLogging := os.Getenv("ENABLE_FILE_LOGGING")
+	if enableFileLogging != "true" && enableFileLogging != "1" {
+		return nil, nil
 	}
 
-	err := cmd.Run()
-	if err != nil {
-		return fmt.Errorf("docker-compose up -d failed: %w", err)
+	logsDir := os.Getenv("LOGS_DIR")
+	if logsDir == "" {
+		logsDir = "logs"
 	}
-	return nil
+	if err := os.MkdirAll(logsDir, 0755); err != nil {
+		return nil, fmt.Errorf("创建日志目录失败: %w", err)
+	}
+
+	logPath := filepath.Join(logsDir, repoName+".log")
+
+	// 使用 lumberjack 实现日志轮转
+	lumberjackLogger := &lumberjack.Logger{
+		Filename:   logPath,
+		MaxSize:    10, // MB
+		MaxBackups: 5,
+		MaxAge:     30, // days
+	}
+
+	return lumberjackLogger, nil
 }
 
-// verifySignature 验证 Gogs Webhook 的签名
-func verifySignature(r *http.Request, body []byte, secret string) bool {
-	// TODO: 这里需要根据 Gogs 的官方文档来实现正确的签名验证逻辑。
-	// 例如，如果 Gogs 使用 HMAC-SHA256，你需要实现类似下面的逻辑：
-	//
-	//  signature := r.Header.Get("X-Gogs-Signature") // 获取 Gogs 发送的签名
-	//  if signature == "" {
-	//      return false
-	//  }
-	//  mac := hmac.New(sha256.New, []byte(secret))
-	//  mac.Write(body)
-	//  expectedSignature := hex.EncodeToString(mac.Sum(nil))
-	//  return signature == expectedSignature
-	//
-	//  目前为了演示，简化处理，直接返回 true，这在生产环境中非常不安全。
-	return true // 示例：不进行实际验证
+// getKeys 返回 map 的所有 key (用于日志)
+func getKeys(m map[string]AppConfig) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// cloneRepository 克隆 Git 仓库到指定目录
+func cloneRepository(repoAddr, repoPath string) error {
+	// 确保父目录存在
+	parentDir := filepath.Dir(repoPath)
+	if err := os.MkdirAll(parentDir, 0755); err != nil {
+		return fmt.Errorf("创建父目录失败: %w", err)
+	}
+
+	// 执行 git clone
+	cmd := exec.Command("git", "clone", repoAddr, repoPath)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("git clone 失败: %w", err)
+	}
+
+	log.Printf("成功克隆 %s 到 %s", repoAddr, repoPath)
+	return nil
 }
