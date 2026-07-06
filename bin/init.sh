@@ -28,14 +28,17 @@ else
     echo ".env 已存在"
 fi
 
-# 复制 systemd 服务文件
-if [ -f conf.d/webhook-handler.service ]; then
-    echo "正在复制 systemd 服务文件..."
-    sudo cp -f conf.d/webhook-handler.service /etc/systemd/system/
-    sudo systemctl daemon-reload
-    echo "服务文件已复制到 /etc/systemd/system/"
+# 复制配置文件 (如果不存在)
+if [ ! -f conf.d/webhookd.yaml ]; then
+    if [ -f conf.d/webhookd.example.yaml ]; then
+        echo "正在从模板创建 webhookd.yaml..."
+        cp conf.d/webhookd.example.yaml conf.d/webhookd.yaml
+        echo "请编辑 conf.d/webhookd.yaml 配置应用"
+    else
+        echo "警告: conf.d/webhookd.example.yaml 未找到"
+    fi
 else
-    echo "警告: conf.d/webhook-handler.service 未找到"
+    echo "webhookd.yaml 已存在"
 fi
 
 # 设置配置文件权限
