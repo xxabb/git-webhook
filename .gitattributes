@@ -1,0 +1,9 @@
+# 强制 shell 脚本使用 LF 换行符，避免 Linux 上出现 CRLF 错误
+*.sh text eol=lf
+
+# 强制 systemd 服务文件使用 LF
+*.service text eol=lf
+
+# 强制 Taskfile 使用 LF
+*.yaml text eol=lf
+*.yml text eol=lf
